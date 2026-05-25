@@ -1,4 +1,4 @@
-# MultiView3D-DINOv2: DINOv2 embedding generation from multi view renderings of 3D specimen models
+# MultiView3D-DINOv2: DINOv2 embedding generation from multi-view renderings of 3D specimen models
 Software pipeline for rendering multi-view images from 3D specimens and extracting frozen DINOv2 embeddings.
 
 ## Requirements
@@ -50,10 +50,12 @@ python -m src.pool_embeddings --features data/features --out data/embeddings --p
 ## Citation
 ```bibtex
 @software{multiview3d_dinov2,
-  title = {MultiView3D-DINOv2},
-  author = {Your Name or Team},
-  year = {2026},
-  note = {Software pipeline for multi-view rendering and frozen DINOv2 embedding generation}
+  title  = {MultiView3D-DINOv2},
+  author = {Ueya, Towa and Iba, Yasuhiro},
+  year   = {2026},
+  url    = {https://github.com/TowaUeya/MultiView3D-DINOv2},
+  doi    = {10.5281/zenodo.20258321},
+  note   = {Software pipeline for multi-view rendering and frozen DINOv2 embedding generation}
 }
 ```
 
