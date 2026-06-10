@@ -11,10 +11,12 @@ from torchvision import transforms
 
 LOGGER = logging.getLogger(__name__)
 
-DINOV2_MEAN = (0.485, 0.456, 0.406)
-DINOV2_STD = (0.229, 0.224, 0.225)
+DINOV3_MEAN = (0.485, 0.456, 0.406)
+DINOV3_STD = (0.229, 0.224, 0.225)
 MODEL_ALIASES = {
-    "dinov2_vits14": "vit_small_patch14_dinov2.lvd142m",
+    "dinov3_vits16": "vit_small_patch16_dinov3.lvd1689m",
+    "dinov3_vitb16": "vit_base_patch16_dinov3.lvd1689m",  # デフォルト
+    "dinov3_vitl16": "vit_large_patch16_dinov3.lvd1689m",
 }
 
 
@@ -33,7 +35,7 @@ def build_transform(image_size: int = 224, crop_size: int = 224) -> transforms.C
             transforms.Resize(image_size, interpolation=transforms.InterpolationMode.BICUBIC),
             transforms.CenterCrop(crop_size),
             transforms.ToTensor(),
-            transforms.Normalize(mean=DINOV2_MEAN, std=DINOV2_STD),
+            transforms.Normalize(mean=DINOV3_MEAN, std=DINOV3_STD),
         ]
     )
 
@@ -48,7 +50,7 @@ def l2_normalize(array: np.ndarray, eps: float = 1e-8) -> np.ndarray:
     return array / np.maximum(norm, eps)
 
 
-def load_dinov2_model(model_name: str, device: torch.device) -> torch.nn.Module:
+def load_dinov3_model(model_name: str, device: torch.device) -> torch.nn.Module:
     timm_name = MODEL_ALIASES.get(model_name, model_name)
     model = timm.create_model(timm_name, pretrained=True)
     model.eval()
@@ -56,22 +58,40 @@ def load_dinov2_model(model_name: str, device: torch.device) -> torch.nn.Module:
     return model
 
 
-def _extract_embedding_tensor(out: torch.Tensor | dict[str, torch.Tensor]) -> torch.Tensor:
+def _drop_register_tokens(tokens: torch.Tensor, num_prefix_tokens: int) -> torch.Tensor:
+
+    if num_prefix_tokens <= 1:
+        # registerトークンなし（CLSのみ）の場合はそのまま
+        return tokens
+    cls = tokens[:, :1]
+    patches = tokens[:, num_prefix_tokens:]
+    return torch.cat([cls, patches], dim=1)
+
+
+def _extract_embedding_tensor(
+    out: torch.Tensor | dict[str, torch.Tensor],
+    num_prefix_tokens: int = 1,
+) -> torch.Tensor:
     if isinstance(out, dict):
         if "x_norm_clstoken" in out:
             return out["x_norm_clstoken"]
         if "x_cls" in out:
             return out["x_cls"]
     if isinstance(out, torch.Tensor):
+        # timmのforward_featuresは全トークン [B, N, D] を返す。
+        # 3Dテンソルのときだけregisterトークンを除外する。
+        if out.dim() == 3:
+            return _drop_register_tokens(out, num_prefix_tokens)
         return out
     raise RuntimeError("Unsupported model output format for embeddings")
 
 
 def forward_embedding(model: torch.nn.Module, batch: torch.Tensor, *, enable_grad: bool = False) -> torch.Tensor:
+    num_prefix_tokens = int(getattr(model, "num_prefix_tokens", 1))
     if enable_grad:
         out = model.forward_features(batch)
-        return _extract_embedding_tensor(out)
+        return _extract_embedding_tensor(out, num_prefix_tokens)
 
     with torch.inference_mode():
         out = model.forward_features(batch)
-    return _extract_embedding_tensor(out)
+    return _extract_embedding_tensor(out, num_prefix_tokens)

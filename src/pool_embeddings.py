@@ -25,6 +25,11 @@ def pool_features(arr: np.ndarray, method: str) -> np.ndarray:
     if arr.ndim < 2:
         raise ValueError(f"Expected [...,D], got shape={arr.shape}")
 
+    if arr.ndim == 2 and method == "max":
+        raise ValueError(
+            "features are token-mean-pooled ([V,D]); re-extract with --keep-tokens to use --pool max"
+        )
+
     pool_axes = tuple(range(arr.ndim - 1))
     if method == "mean":
         return arr.mean(axis=pool_axes)
@@ -47,6 +52,13 @@ def main() -> None:
     if not feature_files:
         LOGGER.warning("No feature files in %s", args.features)
         return
+
+    if args.pool == "max":
+        probe = np.load(feature_files[0], mmap_mode="r")
+        if probe.ndim == 2:
+            raise ValueError(
+                "features are token-mean-pooled ([V,D]); re-extract with --keep-tokens to use --pool max"
+            )
 
     all_embs = []
     all_ids = []

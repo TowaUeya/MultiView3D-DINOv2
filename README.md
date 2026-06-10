@@ -1,5 +1,5 @@
 # MultiView3D-DINOv2: DINOv2 embedding generation from multi-view renderings of 3D specimen models
-Software pipeline for rendering multi-view images from 3D specimens and extracting frozen DINOv2 embeddings.
+Software pipeline for rendering multi-view images from 3D specimens and extracting frozen DINOv3 embeddings.
 
 ## Requirements
 - Python 3.10+
@@ -27,12 +27,12 @@ Run the pipeline in three steps:
 
 1) **render_multiview**
 ```bash
-python -m src.render_multiview --in data/meshes --out data/renders --views 12 --size 518
+python -m src.render_multiview --in data/meshes --out data/renders --views 12 --size 768 --auto-zoom --auto-zoom-probes 12 --jobs 8
 ```
 
 2) **extract_features**
 ```bash
-python -m src.extract_features --renders data/renders --out data/features --model dinov2_vits14 --device auto
+python -m src.extract_features --renders data/renders --out data/features --model dinov3_vitb16 --device auto --image-size 768 --crop-size 768
 ```
 
 3) **pool_embeddings**
@@ -43,14 +43,14 @@ python -m src.pool_embeddings --features data/features --out data/embeddings --p
 ## Outputs
 The pipeline produces:
 - rendered multi-view images under `data/renders/`
-- per-view DINOv2 features under `data/features/`
+- per-view DINOv3 features under `data/features/`
 - specimen-level embeddings under `data/embeddings/`
 - `embeddings.npy` and `ids.txt` for downstream analysis
 
 ## Notes
 - This repository contains only the embedding pipeline.
 - No training or fine-tuning is performed in this repository.
-- DINOv2 is used as a frozen feature extractor.
+- DINOv3 is used as a frozen feature extractor.
 - `render_multiview` requires an OpenGL runtime (for example `libGL.so.1`).
 - `extract_features` downloads pretrained weights on first run unless already cached.
 

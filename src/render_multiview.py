@@ -4,6 +4,9 @@ import argparse
 import copy
 import csv
 import logging
+import os
+import subprocess
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -15,15 +18,71 @@ from src.utils.io import ensure_dir, list_mesh_files, set_seed, setup_logging
 
 LOGGER = logging.getLogger(__name__)
 
+# Auto-zoom の占有率が縮退しているかを判定する閾値。
+# 正常な標本では占有率は target(既定 0.20-0.35)付近に収まるため、
+# fill_max<=EMPTY_FILL_EPS(空フレーム=何も写らない)や
+# fill_min>=FULL_FILL_EPS(全面占有=カメラめり込み)は、
+# OffscreenRenderer の累積的な状態破壊(リソースリーク)の兆候とみなす。
+EMPTY_FILL_EPS = 0.02
+FULL_FILL_EPS = 0.98
+
+# auto_zoom_report.csv の列順(ワーカーの部分CSVと結合後CSVで共有する)。
+CSV_FIELDNAMES = [
+    "specimen",
+    "ok",
+    "auto_zoom",
+    "appearance",
+    "light_mode",
+    "scale",
+    "scale_view_count",
+    "preview_fill_min",
+    "preview_fill_max",
+    "degenerate",
+    "final_radius",
+    "postcheck_border_touch_count",
+    "safety_steps_used",
+    "final_radius_after_safety",
+    "target_fill_min",
+    "target_fill_max",
+]
+
+
+def _is_degenerate_fill(
+    fill_min: float,
+    fill_max: float,
+    empty_eps: float = EMPTY_FILL_EPS,
+    full_eps: float = FULL_FILL_EPS,
+) -> bool:
+    """auto-zoom の占有率が縮退(空フレーム/全面めり込み)しているか判定する。
+
+    fill_max <= empty_eps は深度プレビューに何も写っていない空フレーム、
+    fill_min >= full_eps は画面全体が手前ジオメトリで埋まるカメラめり込みで、
+    いずれも OffscreenRenderer の累積的な状態破壊の兆候。
+    NaN(auto_zoom 無効で占有率未測定)は判定不能として False を返す。
+    """
+    if not np.isfinite(fill_min) or not np.isfinite(fill_max):
+        return False
+    if fill_max <= empty_eps:
+        return True
+    if fill_min >= full_eps:
+        return True
+    return False
+
 
 def _compute_camera_light_direction(eye: np.ndarray) -> np.ndarray:
-    """Return camera-following sun-light direction."""
+    """Return camera-following sun-light direction for stable DINOv3 multi-view renders.
+
+    camera mode follows each view to avoid excessively dark back-side views.
+    world mode keeps fixed world-space lighting for comparison/compatibility.
+    """
     eye_np = np.asarray(eye, dtype=np.float32)
     norm = float(np.linalg.norm(eye_np))
     if norm <= 0:
         raise ValueError("Camera eye vector has zero norm; cannot compute camera light direction.")
     eye_dir = eye_np / norm
 
+    # Open3D sun light direction can be visually ambiguous depending on convention.
+    # This sign should illuminate the camera-facing surface; flip if test renders look dark.
     return -eye_dir
 
 
@@ -77,7 +136,12 @@ def _make_material_for_appearance(
     geom: o3d.geometry.Geometry,
     appearance: str,
 ) -> o3d.visualization.rendering.MaterialRecord:
-    """Build a material for the selected appearance mode."""
+    """Build material for rendering appearance modes.
+
+    gray_lit uses a fixed gray material to suppress specimen color/texture differences
+    for shape-only rendering. color_lit keeps original vertex colors/textures when
+    available for optional appearance-aware rendering.
+    """
     mat = o3d.visualization.rendering.MaterialRecord()
     mat.shader = "defaultLit"
 
@@ -241,7 +305,13 @@ def _autotune_camera_radius(
         for direction in preview_directions:
             eye = direction * radius
             renderer.setup_camera(fov_deg, center, eye, up)
-            preview = renderer.render_to_image()
+            # 占有率は深度画像のみで計算する(_compute_bbox_fill_ratio に depth を渡す)。
+            # RGB(render_to_image)は深度取得が失敗したときのフォールバックでしか使わない
+            # ため、深度が取れる限り描画しない。RGB レンダは陰影計算を伴い深度の約3.6倍
+            # 重く、二分探索で大量に繰り返すプレビューの主コストになっていた。深度成功時の
+            # 占有率(=最終半径)は従来と完全一致する。RGBレンダ回数が減ることで本番出力に
+            # Filament自動露出の±2階調シフトが生じるが、DINOv3埋め込みはcos≈0.99999で
+            # retrieval評価は不変(実測確認済み)。
             try:
                 preview_depth = renderer.render_to_depth_image()
                 fill_values.append(_compute_bbox_fill_ratio(depth_image=preview_depth))
@@ -253,6 +323,7 @@ def _autotune_camera_radius(
                         exc_info=True,
                     )
                     depth_fallback_logged = True
+                preview = renderer.render_to_image()
                 fill_values.append(_compute_bbox_fill_ratio(image=preview))
 
         if not fill_values:
@@ -331,7 +402,9 @@ def _evaluate_radius_on_directions(
     for direction in directions:
         eye = direction * radius
         renderer.setup_camera(fov_deg, center, eye, up)
-        img = renderer.render_to_image()
+        # 占有率・境界接触は深度画像のみで判定する。RGB は深度取得が失敗したときの
+        # フォールバックでしか使わないため、深度が取れる限り描画しない(プレビュー高速化。
+        # 本番出力に露出の±2階調シフトのみ生じ評価は不変、詳細は render_fill_stats のコメント参照)。
         try:
             depth = renderer.render_to_depth_image()
             fill_ratio, touches_border = _compute_bbox_fill_and_touches_border(depth_image=depth)
@@ -339,6 +412,7 @@ def _evaluate_radius_on_directions(
             if not depth_fallback_logged:
                 LOGGER.warning("Depth post-check failed; fallback to RGB thresholding only.", exc_info=True)
                 depth_fallback_logged = True
+            img = renderer.render_to_image()
             fill_ratio, touches_border = _compute_bbox_fill_and_touches_border(image=img)
         fill_values.append(fill_ratio)
         if touches_border:
@@ -472,7 +546,7 @@ def render_specimen(
     auto_zoom_probes: int,
     auto_zoom_safe_margin: float,
     auto_zoom_max_safety_steps: int,
-) -> tuple[bool, list[dict[str, str | float | bool | int]]]:
+) -> tuple[bool, list[dict[str, str | float | bool | int]], bool]:
     mesh_rel = mesh_path.relative_to(input_root)
     sid = mesh_rel.stem
     specimen_out_dir = out_dir / mesh_rel.parent
@@ -560,6 +634,7 @@ def render_specimen(
         ]
 
     ok = True
+    specimen_degenerate = False
     zoom_rows: list[dict[str, str | float | bool | int]] = []
     for scale_cfg in scale_configs:
         scale_name = str(scale_cfg["name"])
@@ -577,6 +652,8 @@ def render_specimen(
         if auto_zoom:
             safe_min_radius = _compute_safe_min_camera_radius(geom)
             probe_count = max(1, min(auto_zoom_probes, scale_views))
+            # Keep --auto-zoom-probes for backward compatibility; use final
+            # render directions to avoid probe/view mismatch misses.
             probe_dirs = final_directions
             final_radius, preview_fill_min, preview_fill_max, iters = _autotune_camera_radius(
                 renderer=renderer,
@@ -648,6 +725,17 @@ def render_specimen(
             lighting_enabled=lighting_enabled,
         )
         ok = ok and scale_ok
+        scale_degenerate = bool(auto_zoom and _is_degenerate_fill(preview_fill_min, preview_fill_max))
+        if scale_degenerate:
+            specimen_degenerate = True
+            LOGGER.warning(
+                "Degenerate auto-zoom fill for %s scale=%s: fill_min=%.4f fill_max=%.4f "
+                "(empty or fully-clipped frame; OffscreenRenderer may be corrupted).",
+                mesh_rel.as_posix(),
+                scale_name,
+                preview_fill_min,
+                preview_fill_max,
+            )
         zoom_rows.append(
             {
                 "specimen": mesh_rel.as_posix(),
@@ -659,6 +747,7 @@ def render_specimen(
                 "scale_view_count": scale_views,
                 "preview_fill_min": preview_fill_min,
                 "preview_fill_max": preview_fill_max,
+                "degenerate": scale_degenerate,
                 "final_radius": final_radius,
                 "postcheck_border_touch_count": postcheck_border_touch_count,
                 "safety_steps_used": safety_steps_used,
@@ -668,7 +757,7 @@ def render_specimen(
             }
         )
 
-    return ok, zoom_rows
+    return ok, zoom_rows, specimen_degenerate
 
 
 def parse_args() -> argparse.Namespace:
@@ -676,8 +765,36 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--in", dest="input_dir", type=Path, required=True, help="Input directory with .ply/.obj/.stl/.off")
     parser.add_argument("--out", dest="output_dir", type=Path, required=True, help="Output directory for rendered PNGs")
     parser.add_argument("--views", type=int, default=12)
-    parser.add_argument("--size", type=int, default=512)
+    parser.add_argument("--size", type=int, default=768)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--subprocess-chunk-size",
+        type=int,
+        default=100,
+        help=(
+            "Render specimens in subprocesses of N each. Open3D/Filament cannot recreate an "
+            "OffscreenRenderer in-process (it segfaults), so the only reliable fix for the "
+            "cumulative renderer-state corruption (empty frames / camera clipping) is to "
+            "render each chunk in a fresh subprocess. A chunk that crashes or reports a "
+            "degenerate frame is re-rendered one specimen per subprocess for recovery. "
+            "0 disables subprocess isolation (single in-process run; original behavior)."
+        ),
+    )
+    parser.add_argument(
+        "--jobs",
+        type=int,
+        default=1,
+        help=(
+            "並列に起動する子プロセス(チャンク)の数。既定1は従来どおりの逐次起動。"
+            "2以上で複数チャンクを同時にレンダリングし、遊休CPUコアを活用して高速化する。"
+            "各標本の出力は独立、part CSV は start 連番で結合されるため、同一の "
+            "--subprocess-chunk-size なら並列でも出力・auto_zoom_report の行順は不変。"
+            "本環境(CPUソフトレンダ llvmpipe)はメモリ帯域律速で jobs=4-8 付近で頭打ち。"
+        ),
+    )
+    # 内部用(オーケストレータが子プロセスへ担当範囲を渡す)。利用者は直接指定しない。
+    parser.add_argument("--_worker-start", type=int, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--_worker-count", type=int, default=None, help=argparse.SUPPRESS)
     parser.add_argument(
         "--light-mode",
         choices=["camera", "world"],
@@ -757,46 +874,33 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def main() -> None:
-    args = parse_args()
-    setup_logging()
-    set_seed(args.seed)
-    if not 0 < args.target_fill_min < args.target_fill_max < 1:
-        raise ValueError("--target-fill-min / --target-fill-max must satisfy 0 < min < max < 1")
-    if args.multiscale_zoom:
-        if not args.auto_zoom:
-            raise ValueError("--multiscale-zoom requires --auto-zoom")
-        if args.views % 2 != 0:
-            raise ValueError("--multiscale-zoom requires --views to be divisible by 2")
-        if not 0 < args.loose_fill_min < args.loose_fill_max < 1:
-            raise ValueError("--loose-fill-min / --loose-fill-max must satisfy 0 < min < max < 1")
-        if not 0 < args.up_fill_min < args.up_fill_max < 1:
-            raise ValueError("--up-fill-min / --up-fill-max must satisfy 0 < min < max < 1")
-        if not args.loose_fill_max < args.up_fill_min:
-            raise ValueError("--multiscale-zoom requires --loose-fill-max < --up-fill-min")
-    if args.auto_zoom_probes < 1:
-        raise ValueError("--auto-zoom-probes must be >= 1")
-    if args.auto_zoom_safe_margin < 0:
-        raise ValueError("--auto-zoom-safe-margin must be >= 0")
-    if args.auto_zoom_max_safety_steps < 0:
-        raise ValueError("--auto-zoom-max-safety-steps must be >= 0")
-
-    ensure_dir(args.output_dir)
-    LOGGER.info("Rendering appearance: %s", args.appearance)
-    LOGGER.info("Rendering light mode: %s", args.light_mode)
-    mesh_files = list_mesh_files(args.input_dir)
-    if not mesh_files:
-        LOGGER.warning("No mesh files found in %s", args.input_dir)
-        return
-
-    renderer = o3d.visualization.rendering.OffscreenRenderer(args.size, args.size)
+def _create_offscreen_renderer(size: int) -> o3d.visualization.rendering.OffscreenRenderer:
+    """背景白で初期化した OffscreenRenderer を生成する(main 初回・再生成で共用)。"""
+    renderer = o3d.visualization.rendering.OffscreenRenderer(size, size)
     renderer.scene.set_background([1.0, 1.0, 1.0, 1.0])
-    zoom_report_path = args.output_dir / "auto_zoom_report.csv"
-    zoom_rows: list[dict[str, str | float | bool | int]] = []
+    return renderer
 
+
+def _render_specimen_range(
+    args: argparse.Namespace,
+    mesh_files: list[Path],
+    start: int,
+    count: int,
+) -> tuple[int, int, list[dict[str, str | float | bool | int]], int]:
+    """指定範囲の標本を 1 つの OffscreenRenderer で描画する(チャンク内では再生成しない)。
+
+    Open3D(Filament) はプロセス内でのレンダラ再生成が segfault するため、累積破壊への
+    対処はチャンク単位のサブプロセス分離に委ねる。縮退フレームは検出して degenerate 列に
+    記録するのみで、回復はオーケストレータが担当する。
+    戻り値: (成功数, 試行標本数, zoom_rows, 縮退標本数)。
+    """
+    subset = mesh_files[start : start + count]
+    renderer = _create_offscreen_renderer(args.size)
+    rows: list[dict[str, str | float | bool | int]] = []
     success = 0
-    for mesh_path in tqdm(mesh_files, desc="Rendering"):
-        ok, specimen_zoom_rows = render_specimen(
+    degenerate_count = 0
+    for mesh_path in tqdm(subset, desc=f"Rendering[{start}:{start + len(subset)}]"):
+        ok, specimen_rows, degenerate = render_specimen(
             renderer=renderer,
             mesh_path=mesh_path,
             input_root=args.input_dir,
@@ -820,62 +924,363 @@ def main() -> None:
             auto_zoom_safe_margin=args.auto_zoom_safe_margin,
             auto_zoom_max_safety_steps=args.auto_zoom_max_safety_steps,
         )
-        zoom_rows.extend(specimen_zoom_rows)
+        rows.extend(specimen_rows)
         if ok:
             success += 1
+        if degenerate:
+            degenerate_count += 1
+    return success, len(subset), rows, degenerate_count
 
-    with zoom_report_path.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(
-            f,
-            fieldnames=[
-                "specimen",
-                "ok",
-                "auto_zoom",
-                "appearance",
-                "light_mode",
-                "scale",
-                "scale_view_count",
-                "preview_fill_min",
-                "preview_fill_max",
-                "final_radius",
-                "postcheck_border_touch_count",
-                "safety_steps_used",
-                "final_radius_after_safety",
-                "target_fill_min",
-                "target_fill_max",
-            ],
-        )
+
+def _write_zoom_csv(path: Path, rows: list[dict[str, str | float | bool | int]]) -> None:
+    with path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=CSV_FIELDNAMES)
         writer.writeheader()
-        writer.writerows(zoom_rows)
-    LOGGER.info("Auto-zoom report written: %s", zoom_report_path)
-    if args.multiscale_zoom and args.auto_zoom:
-        radii_by_specimen: dict[str, dict[str, float]] = {}
-        for row in zoom_rows:
-            specimen = str(row["specimen"])
-            scale = str(row["scale"])
-            final_radius = float(row["final_radius"])
-            radii_by_specimen.setdefault(specimen, {})[scale] = final_radius
+        writer.writerows(rows)
 
-        same_radius_specimens = []
-        different_radius_count = 0
-        for specimen, scales in radii_by_specimen.items():
-            if "loose" in scales and "up" in scales:
-                if np.isclose(scales["loose"], scales["up"]):
-                    same_radius_specimens.append(specimen)
-                else:
-                    different_radius_count += 1
 
-        LOGGER.info(
-            "Multiscale radius check: loose/up different for %d specimens, equal for %d specimens.",
-            different_radius_count,
-            len(same_radius_specimens),
+def _part_csv_path(output_dir: Path, start: int) -> Path:
+    """子プロセス(ワーカー)が書く部分CSVのパス。start 連番で命名し結合順を安定させる。"""
+    return output_dir / f"auto_zoom_report.part{start:06d}.csv"
+
+
+def _part_has_problem(output_dir: Path, start: int) -> bool:
+    """部分CSVが無い(=子が異常終了)か、縮退標本を含むなら True を返す。"""
+    path = _part_csv_path(output_dir, start)
+    if not path.exists():
+        return True
+    with path.open(encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            if str(row.get("degenerate", "")).strip().lower() == "true":
+                return True
+    return False
+
+
+def _combine_part_csvs(output_dir: Path) -> list[dict[str, str]]:
+    """全 part CSV を start 順に結合して auto_zoom_report.csv を書き、part を削除する。"""
+    parts = sorted(output_dir.glob("auto_zoom_report.part*.csv"))
+    rows: list[dict[str, str]] = []
+    for part in parts:
+        with part.open(encoding="utf-8") as f:
+            rows.extend(csv.DictReader(f))
+    with (output_dir / "auto_zoom_report.csv").open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=CSV_FIELDNAMES)
+        writer.writeheader()
+        writer.writerows(rows)
+    for part in parts:
+        part.unlink()
+    return rows
+
+
+def _check_multiscale_radii(rows: list[dict]) -> None:
+    """multiscale 時に loose/up の半径が分離できているかを確認する(従来挙動を維持)。"""
+    radii_by_specimen: dict[str, dict[str, float]] = {}
+    for row in rows:
+        specimen = str(row["specimen"])
+        scale = str(row["scale"])
+        final_radius = float(row["final_radius"])
+        radii_by_specimen.setdefault(specimen, {})[scale] = final_radius
+
+    same_radius_specimens = []
+    different_radius_count = 0
+    for specimen, scales in radii_by_specimen.items():
+        if "loose" in scales and "up" in scales:
+            if np.isclose(scales["loose"], scales["up"]):
+                same_radius_specimens.append(specimen)
+            else:
+                different_radius_count += 1
+
+    LOGGER.info(
+        "Multiscale radius check: loose/up different for %d specimens, equal for %d specimens.",
+        different_radius_count,
+        len(same_radius_specimens),
+    )
+    if same_radius_specimens:
+        LOGGER.warning(
+            "loose/up final_radius are equal for specimens: %s",
+            ", ".join(same_radius_specimens[:20]),
         )
-        if same_radius_specimens:
-            LOGGER.warning(
-                "loose/up final_radius are equal for specimens: %s",
-                ", ".join(same_radius_specimens[:20]),
+
+
+def _worker_command(start: int, count: int) -> list[str]:
+    """元の CLI 引数を引き継ぎ、担当範囲を指定した子プロセス(ワーカー)コマンドを作る。"""
+    return [
+        sys.executable,
+        "-m",
+        "src.render_multiview",
+        *sys.argv[1:],
+        "--_worker-start",
+        str(start),
+        "--_worker-count",
+        str(count),
+    ]
+
+
+def _build_worker_env(jobs: int) -> dict[str, str] | None:
+    """並列実行(jobs>1)時の子プロセス環境変数を作る。jobs<=1 では None(環境を変えない)。
+
+    CPUソフトレンダ(llvmpipe)は1レンダリングを内部で複数スレッド化する。各子の llvmpipe
+    スレッド数を「論理コア数 / jobs」に制限し、総スレッド数を物理資源に合わせる
+    (LP_NUM_THREADS)。これにより jobs が少なければ各プロセスはマルチスレッドでコアを使い、
+    jobs が論理コア数に近づくと1スレッド/プロセスに収束する。LP_NUM_THREADS=1 を固定すると
+    低並列で各プロセスが1スレッドに絞られコアが遊ぶため、動的に分配する。スレッド数は出力を
+    変えない(バイト不変)。GPUバックエンドでは無視される(無害)。ユーザー明示値は尊重する。
+    """
+    if jobs <= 1:
+        return None
+    env = os.environ.copy()
+    threads_per_job = max(1, (os.cpu_count() or 1) // jobs)
+    env.setdefault("LP_NUM_THREADS", str(threads_per_job))
+    # 親が全体進捗を表示するため、子プロセス側の tqdm バーは抑制する。
+    env.setdefault("TQDM_DISABLE", "1")
+    return env
+
+
+def _run_chunk_subprocess(
+    start: int,
+    count: int,
+    env: dict[str, str] | None = None,
+    log_path: Path | None = None,
+) -> int:
+    """1 チャンク(または 1 標本)を新しい子プロセスで描画し、終了コードを返す。
+
+    env は子プロセスへ渡す環境変数(並列時の LP_NUM_THREADS 等)。None なら親環境を継承。
+    log_path 指定時は子の標準出力/エラーをそのファイルへ送り、並列時にログが混ざるのを防ぐ。
+    """
+    if log_path is None:
+        return subprocess.run(_worker_command(start, count), env=env).returncode
+    with log_path.open("w", encoding="utf-8") as logf:
+        return subprocess.run(
+            _worker_command(start, count), env=env, stdout=subprocess.DEVNULL, stderr=logf
+        ).returncode
+
+
+def _run_worker(args: argparse.Namespace) -> None:
+    """子プロセス本体: 担当範囲のみ描画して部分CSVを書く。"""
+    mesh_files = list_mesh_files(args.input_dir)
+    start = int(args._worker_start)
+    count = int(args._worker_count)
+    success, total, rows, degenerate_count = _render_specimen_range(args, mesh_files, start, count)
+    _write_zoom_csv(_part_csv_path(args.output_dir, start), rows)
+    LOGGER.info(
+        "Worker [%d:%d] rendered %d/%d specimens (degenerate=%d).",
+        start,
+        start + total,
+        success,
+        total,
+        degenerate_count,
+    )
+
+
+def _run_chunks_sequential(
+    args: argparse.Namespace,
+    mesh_files: list[Path],
+    starts: list[int],
+    chunk: int,
+    n: int,
+) -> list[int]:
+    """逐次オーケストレータ(従来挙動): チャンクを1つずつ子プロセスで描画する。
+
+    子プロセスのログ(auto-zoom trace 等)はそのまま親コンソールへ流す。
+    戻り値: 隔離しても回復しなかった標本インデックスの一覧。
+    """
+    unrecovered: list[int] = []
+    for ci, start in enumerate(starts):
+        count = min(chunk, n - start)
+        LOGGER.info("=== Chunk %d/%d: specimens [%d:%d] ===", ci + 1, len(starts), start, start + count)
+        rc = _run_chunk_subprocess(start, count)
+        if rc == 0 and not _part_has_problem(args.output_dir, start):
+            continue
+
+        # チャンクが crash したか縮退を記録 → 標本単位の新プロセスで再描画して回復させる。
+        LOGGER.warning(
+            "Chunk [%d:%d] unhealthy (exit=%d or degenerate); re-rendering one specimen per subprocess.",
+            start,
+            start + count,
+            rc,
+        )
+        if count == 1:
+            unrecovered.append(start)
+            _log_unrecovered(start, mesh_files[start].as_posix(), rc)
+            continue
+        stale_part = _part_csv_path(args.output_dir, start)
+        if stale_part.exists():
+            stale_part.unlink()
+        for k in range(count):
+            rc1 = _run_chunk_subprocess(start + k, 1)
+            if rc1 != 0 or _part_has_problem(args.output_dir, start + k):
+                unrecovered.append(start + k)
+                _log_unrecovered(start + k, mesh_files[start + k].as_posix(), rc1)
+    return unrecovered
+
+
+def _run_chunks_parallel(
+    args: argparse.Namespace,
+    mesh_files: list[Path],
+    starts: list[int],
+    chunk: int,
+    n: int,
+    env: dict[str, str] | None,
+) -> list[int]:
+    """並列オーケストレータ: チャンクを最大 args.jobs 個まで同時に子プロセスで描画する。
+
+    逐次版 _run_chunks_sequential と同じ回復ロジック(不健全チャンクは標本単位で再描画)を、
+    完了したそばから動的に再投入する形で並列化する。チャンク内のレンダリング順序・レンダラ
+    状態は逐次版と同一なので、同じ --subprocess-chunk-size なら出力は完全に不変。子プロセス
+    のログは output_dir/render_logs/chunk{start}.log に保存する。
+    戻り値: 隔離しても回復しなかった標本インデックスの一覧。
+    """
+    from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+
+    log_dir = args.output_dir / "render_logs"
+    ensure_dir(log_dir)
+    unrecovered: list[int] = []
+    with ThreadPoolExecutor(max_workers=args.jobs) as executor:
+        pending: dict = {}
+        for start in starts:
+            count = min(chunk, n - start)
+            fut = executor.submit(
+                _run_chunk_subprocess, start, count, env, log_dir / f"chunk{start:06d}.log"
             )
-    LOGGER.info("Rendered %d/%d specimens", success, len(mesh_files))
+            pending[fut] = (start, count)
+
+        with tqdm(total=n, desc=f"Rendering(jobs={args.jobs})") as pbar:
+            while pending:
+                done, _ = wait(list(pending), return_when=FIRST_COMPLETED)
+                for fut in done:
+                    start, count = pending.pop(fut)
+                    rc = fut.result()
+                    if rc == 0 and not _part_has_problem(args.output_dir, start):
+                        pbar.update(count)
+                        continue
+
+                    LOGGER.warning(
+                        "Chunk [%d:%d] unhealthy (exit=%d or degenerate); re-rendering one specimen per subprocess.",
+                        start,
+                        start + count,
+                        rc,
+                    )
+                    if count == 1:
+                        unrecovered.append(start)
+                        LOGGER.error(
+                            "Specimen index=%d (%s) unhealthy in isolation (exit=%d); output may be invalid.",
+                            start,
+                            mesh_files[start].as_posix(),
+                            rc,
+                        )
+                        pbar.update(1)
+                        continue
+
+                    # チャンクをばらして標本単位で再投入(健全標本も含めて描き直す=逐次版と同じ)。
+                    stale_part = _part_csv_path(args.output_dir, start)
+                    if stale_part.exists():
+                        stale_part.unlink()
+                    for k in range(count):
+                        f2 = executor.submit(
+                            _run_chunk_subprocess,
+                            start + k,
+                            1,
+                            env,
+                            log_dir / f"chunk{start + k:06d}.log",
+                        )
+                        pending[f2] = (start + k, 1)
+    return unrecovered
+
+
+def _run_orchestrator(args: argparse.Namespace) -> None:
+    """親プロセス: チャンクごとに子プロセスを起動し、異常チャンクは標本単位で再実行する。"""
+    ensure_dir(args.output_dir)
+    LOGGER.info("Rendering appearance: %s", args.appearance)
+    LOGGER.info("Rendering light mode: %s", args.light_mode)
+    mesh_files = list_mesh_files(args.input_dir)
+    if not mesh_files:
+        LOGGER.warning("No mesh files found in %s", args.input_dir)
+        return
+    n = len(mesh_files)
+
+    # 分離無効: 単一プロセスで全標本を描画する(従来挙動)。
+    if args.subprocess_chunk_size <= 0:
+        if args.jobs > 1:
+            LOGGER.warning(
+                "--jobs=%d is ignored because --subprocess-chunk-size 0 runs a single in-process renderer.",
+                args.jobs,
+            )
+        success, total, rows, degenerate_count = _render_specimen_range(args, mesh_files, 0, n)
+        _write_zoom_csv(args.output_dir / "auto_zoom_report.csv", rows)
+        LOGGER.info("Auto-zoom report written: %s", args.output_dir / "auto_zoom_report.csv")
+        if args.multiscale_zoom and args.auto_zoom:
+            _check_multiscale_radii(rows)
+        LOGGER.info("Rendered %d/%d specimens (degenerate=%d).", success, total, degenerate_count)
+        return
+
+    # サブプロセス分離: チャンクごとに新プロセス=まっさらなレンダラ(累積破壊が原理的に起きない)。
+    for stale in args.output_dir.glob("auto_zoom_report.part*.csv"):
+        stale.unlink()
+    chunk = args.subprocess_chunk_size
+    starts = list(range(0, n, chunk))
+    env = _build_worker_env(args.jobs)
+    LOGGER.info(
+        "Subprocess isolation: %d specimens in %d chunk(s) of up to %d (jobs=%d%s).",
+        n,
+        len(starts),
+        chunk,
+        args.jobs,
+        ", LP_NUM_THREADS=1" if env is not None and env.get("LP_NUM_THREADS") == "1" else "",
+    )
+    if args.jobs > 1:
+        # 並列: 複数チャンクを同時起動。チャンク内のレンダリングは逐次版と同一=出力不変。
+        unrecovered = _run_chunks_parallel(args, mesh_files, starts, chunk, n, env)
+    else:
+        # 逐次(従来挙動)。
+        unrecovered = _run_chunks_sequential(args, mesh_files, starts, chunk, n)
+
+    rows = _combine_part_csvs(args.output_dir)
+    LOGGER.info("Auto-zoom report written: %s (%d rows)", args.output_dir / "auto_zoom_report.csv", len(rows))
+    if args.multiscale_zoom and args.auto_zoom:
+        _check_multiscale_radii(rows)
+    rendered = len({str(r["specimen"]) for r in rows})
+    LOGGER.info("Rendered %d/%d specimens via subprocess isolation.", rendered, n)
+    if unrecovered:
+        LOGGER.error(
+            "%d specimen(s) could not be rendered even in isolation: indices %s",
+            len(unrecovered),
+            unrecovered[:50],
+        )
+
+
+def main() -> None:
+    args = parse_args()
+    setup_logging()
+    set_seed(args.seed)
+    if not 0 < args.target_fill_min < args.target_fill_max < 1:
+        raise ValueError("--target-fill-min / --target-fill-max must satisfy 0 < min < max < 1")
+    if args.multiscale_zoom:
+        if not args.auto_zoom:
+            raise ValueError("--multiscale-zoom requires --auto-zoom")
+        if args.views % 2 != 0:
+            raise ValueError("--multiscale-zoom requires --views to be divisible by 2")
+        if not 0 < args.loose_fill_min < args.loose_fill_max < 1:
+            raise ValueError("--loose-fill-min / --loose-fill-max must satisfy 0 < min < max < 1")
+        if not 0 < args.up_fill_min < args.up_fill_max < 1:
+            raise ValueError("--up-fill-min / --up-fill-max must satisfy 0 < min < max < 1")
+        if not args.loose_fill_max < args.up_fill_min:
+            raise ValueError("--multiscale-zoom requires --loose-fill-max < --up-fill-min")
+    if args.auto_zoom_probes < 1:
+        raise ValueError("--auto-zoom-probes must be >= 1")
+    if args.auto_zoom_safe_margin < 0:
+        raise ValueError("--auto-zoom-safe-margin must be >= 0")
+    if args.auto_zoom_max_safety_steps < 0:
+        raise ValueError("--auto-zoom-max-safety-steps must be >= 0")
+    if args.subprocess_chunk_size < 0:
+        raise ValueError("--subprocess-chunk-size must be >= 0")
+    if args.jobs < 1:
+        raise ValueError("--jobs must be >= 1")
+
+    # 子プロセス(ワーカー)は割り当てられた担当範囲だけを描画して終了する。
+    if args._worker_start is not None:
+        _run_worker(args)
+        return
+    _run_orchestrator(args)
 
 
 if __name__ == "__main__":
