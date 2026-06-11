@@ -29,6 +29,9 @@ Run the pipeline in three steps:
 ```bash
 python -m src.render_multiview --in data/meshes --out data/renders --views 12 --size 768 --auto-zoom --auto-zoom-probes 12 --jobs 8
 ```
+- `--appearance {gray_lit,color_lit}`
+  - `gray_lit`: Renders the input mesh/point cloud with a fixed gray material, ignoring any vertex colors or textures. This is the standard setting for comparing morphology, shading, and silhouettes only.
+  - `color_lit`: Renders the input mesh/point cloud while preserving vertex colors, textures, or point colors. This option is used to evaluate appearance including color and texture information.
 
 2) **extract_features**
 ```bash
