@@ -15,7 +15,7 @@ DINOV3_MEAN = (0.485, 0.456, 0.406)
 DINOV3_STD = (0.229, 0.224, 0.225)
 MODEL_ALIASES = {
     "dinov3_vits16": "vit_small_patch16_dinov3.lvd1689m",
-    "dinov3_vitb16": "vit_base_patch16_dinov3.lvd1689m",  # デフォルト
+    "dinov3_vitb16": "vit_base_patch16_dinov3.lvd1689m",  # default
     "dinov3_vitl16": "vit_large_patch16_dinov3.lvd1689m",
 }
 
@@ -61,7 +61,7 @@ def load_dinov3_model(model_name: str, device: torch.device) -> torch.nn.Module:
 def _drop_register_tokens(tokens: torch.Tensor, num_prefix_tokens: int) -> torch.Tensor:
 
     if num_prefix_tokens <= 1:
-        # registerトークンなし（CLSのみ）の場合はそのまま
+        # No register tokens (CLS only): return as-is
         return tokens
     cls = tokens[:, :1]
     patches = tokens[:, num_prefix_tokens:]
@@ -78,8 +78,8 @@ def _extract_embedding_tensor(
         if "x_cls" in out:
             return out["x_cls"]
     if isinstance(out, torch.Tensor):
-        # timmのforward_featuresは全トークン [B, N, D] を返す。
-        # 3Dテンソルのときだけregisterトークンを除外する。
+        # timm's forward_features returns all tokens [B, N, D].
+        # Drop register tokens only when the output is a 3D tensor.
         if out.dim() == 3:
             return _drop_register_tokens(out, num_prefix_tokens)
         return out

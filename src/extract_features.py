@@ -41,6 +41,62 @@ def _collate_single(batch):
     return batch[0]
 
 
+def _is_cuda_oom(exc: BaseException) -> bool:
+    """Return True if the exception looks like a CUDA out-of-memory error."""
+    return isinstance(exc, RuntimeError) and "out of memory" in str(exc).lower()
+
+
+def _embed_specimen_views(
+    model: torch.nn.Module,
+    views: torch.Tensor,
+    device: torch.device,
+    batch_size: int,
+    keep_tokens: bool,
+) -> np.ndarray:
+    """Embed all views of one specimen and return a stacked feature array.
+
+    Views are processed in chunks of at most ``batch_size``. On a CUDA
+    out-of-memory error the failing chunk is retried with a halved chunk size
+    (down to a single view) after clearing the allocator cache, so that
+    low-memory GPUs can finish instead of aborting the whole run.
+    """
+    parts: list[np.ndarray] = []
+    num_views = int(views.shape[0])
+    idx = 0
+    chunk = max(1, batch_size)
+    while idx < num_views:
+        bt = views[idx : idx + chunk].to(device, non_blocking=True)
+        try:
+            with torch.inference_mode():
+                z = forward_embedding(model, bt)  # [b, T, D] (CLS+patch, register tokens already dropped)
+                if not keep_tokens:
+                    # Pre-mean on the same token axis (=1) that pool_embeddings reduces -> [b, D]
+                    z = z.mean(dim=1)
+                arr = z.detach().cpu().numpy()
+            parts.append(arr)
+            idx += chunk
+        except RuntimeError as exc:
+            # Only recover from CUDA OOM, and only while there is still room to shrink.
+            if not _is_cuda_oom(exc) or chunk == 1:
+                raise
+            del bt
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+            reduced = max(1, chunk // 2)
+            LOGGER.warning(
+                "CUDA OOM while embedding %d view(s); retrying with chunk size %d",
+                chunk,
+                reduced,
+            )
+            chunk = reduced
+
+    if len(parts) == 1:
+        feature_arr = parts[0]
+    else:
+        feature_arr = np.concatenate(parts, axis=0)  # [V, T, D] or [V, D]
+    return feature_arr.astype(np.float32, copy=False)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Extract frozen DINOv3 features from rendered images")
     parser.add_argument("--renders", type=Path, required=True)
@@ -55,6 +111,25 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=4,
         help="DataLoader worker processes for image decode/transform (0 = main process)",
+    )
+    parser.add_argument(
+        "--safe-mode",
+        action="store_true",
+        help=(
+            "Run with the most conservative DataLoader settings "
+            "(num_workers=0, pin_memory off, persistent_workers off). "
+            "Use this on low-memory GPUs that hit CUDA out-of-memory during extraction."
+        ),
+    )
+    parser.add_argument(
+        "--no-pin-memory",
+        action="store_true",
+        help="Disable pinned memory for host-to-GPU transfer (lowers host memory pressure).",
+    )
+    parser.add_argument(
+        "--no-persistent-workers",
+        action="store_true",
+        help="Disable persistent DataLoader workers (only relevant when --num-workers > 0).",
     )
     parser.add_argument(
         "--keep-tokens",
@@ -80,16 +155,32 @@ def main() -> None:
         return
 
     grouped = group_renders_by_specimen(render_files, root_dir=args.renders)
-    items = sorted(grouped.items())  # 安定した順序の (sid, [paths])
+    items = sorted(grouped.items())  # stable ordering of (sid, [paths])
     transform = build_transform(args.image_size, args.crop_size)
     device = resolve_device(args.device)
     model = load_dinov3_model(args.model, device)
+
+    # Resolve DataLoader settings. Safe mode forces the most conservative
+    # configuration, which avoids the pinned-memory and worker-prefetch pressure
+    # that can trigger CUDA out-of-memory on low-memory GPUs.
+    if args.safe_mode:
+        num_workers = 0
+        use_pin_memory = False
+        use_persistent_workers = False
+    else:
+        num_workers = args.num_workers
+        use_pin_memory = (device.type == "cuda") and not args.no_pin_memory
+        use_persistent_workers = (num_workers > 0) and not args.no_persistent_workers
+
     LOGGER.info(
-        "Using device=%s model=%s keep_tokens=%s num_workers=%d",
+        "Using device=%s model=%s keep_tokens=%s safe_mode=%s num_workers=%d pin_memory=%s persistent_workers=%s",
         device,
         args.model,
         args.keep_tokens,
-        args.num_workers,
+        args.safe_mode,
+        num_workers,
+        use_pin_memory,
+        use_persistent_workers,
     )
 
     dataset = SpecimenViewsDataset(items, transform)
@@ -98,9 +189,9 @@ def main() -> None:
         batch_size=1,
         shuffle=False,
         drop_last=False,
-        num_workers=args.num_workers,
-        pin_memory=(device.type == "cuda"),
-        persistent_workers=(args.num_workers > 0),
+        num_workers=num_workers,
+        pin_memory=use_pin_memory,
+        persistent_workers=use_persistent_workers,
         collate_fn=_collate_single,
     )
 
@@ -110,21 +201,7 @@ def main() -> None:
             LOGGER.warning("No valid images for specimen %s", sid)
             continue
 
-        parts: list[np.ndarray] = []
-        with torch.inference_mode():
-            for idx in range(0, views.shape[0], args.batch_size):
-                bt = views[idx : idx + args.batch_size].to(device, non_blocking=True)
-                z = forward_embedding(model, bt)  # [b, T, D] (CLS+patch, register除外済み)
-                if not args.keep_tokens:
-                    # pool_embeddings が reduce するのと同一のトークン軸(=1)で事前 mean -> [b, D]
-                    z = z.mean(dim=1)
-                parts.append(z.detach().cpu().numpy())
-
-        if len(parts) == 1:
-            feature_arr = parts[0]
-        else:
-            feature_arr = np.concatenate(parts, axis=0)  # [V,T,D] または [V,D]
-        feature_arr = feature_arr.astype(np.float32, copy=False)
+        feature_arr = _embed_specimen_views(model, views, device, args.batch_size, args.keep_tokens)
 
         out_path = args.out / f"{sid}.npy"
         out_path.parent.mkdir(parents=True, exist_ok=True)

@@ -35,6 +35,12 @@ python -m src.render_multiview --in data/meshes --out data/renders --views 12 --
 python -m src.extract_features --renders data/renders --out data/features --model dinov3_vitb16 --device auto --image-size 768 --crop-size 768
 ```
 
+On low-memory GPUs that crash with `CUDA error: out of memory`, add `--safe-mode`:
+```bash
+python -m src.extract_features --renders data/renders --out data/features --model dinov3_vitb16 --device auto --image-size 768 --crop-size 768 --safe-mode
+```
+See [Troubleshooting](#troubleshooting) for details.
+
 3) **pool_embeddings**
 ```bash
 python -m src.pool_embeddings --features data/features --out data/embeddings --pool mean
@@ -53,6 +59,52 @@ The pipeline produces:
 - DINOv3 is used as a frozen feature extractor.
 - `render_multiview` requires an OpenGL runtime (for example `libGL.so.1`).
 - `extract_features` downloads pretrained weights on first run unless already cached.
+
+## Troubleshooting
+
+### CUDA out of memory during `extract_features`
+
+On GPUs with limited memory (for example, 11 GB), feature extraction can fail with:
+
+```text
+torch.AcceleratorError: CUDA error: out of memory
+```
+
+This often originates from the DataLoader: pinned memory and persistent worker
+prefetching keep several large multi-view batches resident at once. The first
+thing to try is **safe mode**, which forces the most conservative DataLoader
+configuration (`num_workers=0`, `pin_memory` off, `persistent_workers` off):
+
+```bash
+python -m src.extract_features \
+  --renders data/renders \
+  --out data/features \
+  --model dinov3_vitb16 \
+  --device auto \
+  --image-size 768 \
+  --crop-size 768 \
+  --safe-mode
+```
+
+The relevant flags are:
+
+| Flag | Effect |
+| --- | --- |
+| `--safe-mode` | Forces `num_workers=0`, `pin_memory` off, and `persistent_workers` off in one step. |
+| `--no-pin-memory` | Disables pinned host memory (a transfer-speed optimization, not required). |
+| `--no-persistent-workers` | Disables worker reuse across iterations (only relevant when `--num-workers > 0`). |
+
+`pin_memory=True` only speeds up host-to-GPU transfer and `persistent_workers=True`
+only helps across multiple epochs, so disabling them is safe for a single
+extraction pass.
+
+Independently of these flags, the forward pass already recovers from CUDA
+out-of-memory by automatically halving the per-forward chunk size (down to a
+single view) and retrying, so a transient spike does not abort the whole run.
+
+If safe mode alone is not enough, reduce the input resolution before pushing it
+higher again, e.g. `--image-size 384 --crop-size 384`, then `518`, then `768`.
+You can also lower `--batch-size` (images per forward pass).
 
 ## Citation
 ```bibtex
