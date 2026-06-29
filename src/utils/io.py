@@ -15,7 +15,7 @@ except Exception:  # pragma: no cover
 
 LOGGER = logging.getLogger(__name__)
 
-MESH_EXTENSIONS = {".ply", ".obj", ".stl", ".off"}
+MESH_EXTENSIONS = {".ply", ".obj", ".stl", ".off", ".glb"}
 
 
 def setup_logging(level: int = logging.INFO) -> None:
